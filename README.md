@@ -1,5 +1,11 @@
 # Any Auto Register
 
+<p align="center">
+  <a href="https://linux.do" target="_blank">
+    <img src="https://img.shields.io/badge/LINUX-DO-FFB003?style=for-the-badge&logo=linux&logoColor=white" alt="LINUX DO" />
+  </a>
+</p>
+
 > ⚠️ 免责声明：本项目仅供学习和研究使用，不得用于任何商业用途。使用本项目所产生的一切后果由使用者自行承担。
 
 多平台账号自动注册与管理系统，支持插件化扩展，内置 Web UI，并可自动拉起本地 Turnstile Solver。
