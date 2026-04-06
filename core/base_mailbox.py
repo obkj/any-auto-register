@@ -7,8 +7,16 @@ import time
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Any, Callable
+from typing import Optional, Any, Callable, Dict, List
 from .proxy_utils import build_requests_proxy_config
+
+import google.auth
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+import base64
+import re
+import requests
 
 
 @dataclass
@@ -210,6 +218,123 @@ class BaseMailbox(ABC):
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
+class GmailMailbox(BaseMailbox):
+    """Google Gmail API 收信服务 (端口 145:1 实现)"""
+    def __init__(self, config: dict, proxy: str = None):
+        self.config = config
+        self.client_id = config.get("client_id")
+        self.client_secret = config.get("client_secret")
+        self.refresh_token = config.get("refresh_token")
+        self.gmail_base = config.get("gmail_base")
+        self.proxy = build_requests_proxy_config(proxy)
+        self.creds = None
+        self.service = None
+
+    def _get_service(self):
+        if self.service: return self.service
+        if not (self.refresh_token and self.client_id and self.client_secret):
+            raise RuntimeError("Gmail credentials missing")
+        self.creds = Credentials(
+            None,
+            refresh_token=self.refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            scopes=['https://www.googleapis.com/auth/gmail.readonly']
+        )
+        if not self.creds.valid:
+            self.creds.refresh(Request())
+        self.service = build('gmail', 'v1', credentials=self.creds)
+        return self.service
+
+    def get_email(self) -> MailboxAccount:
+        if not self.gmail_base: raise RuntimeError("gmail_base not configured")
+        user, domain = self.gmail_base.split('@')
+        prefix = ''.join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8))
+        email = f"{user}+{prefix}@{domain}"
+        return MailboxAccount(email=email, account_id=prefix)
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        try:
+            service = self._get_service()
+            query = f"{account.email}"
+            results = service.users().messages().list(userId='me', q=query, maxResults=10).execute()
+            return {m['id'] for m in results.get('messages', [])}
+        except Exception:
+            return set()
+
+    def wait_for_code(self, account: MailboxAccount, keyword: str = "", timeout: int = 120, before_ids: set = None, code_pattern: str = None, **kwargs) -> str:
+        service = self._get_service()
+        seen = set(before_ids) if before_ids else set()
+        
+        def poll_once() -> Optional[str]:
+            results = service.users().messages().list(userId='me', q=account.email, maxResults=5).execute()
+            messages = results.get('messages', [])
+            for msg in messages:
+                if msg['id'] in seen: continue
+                seen.add(msg['id'])
+                detail = service.users().messages().get(userId='me', id=msg['id'], format='full').execute()
+                
+                body = ""
+                payload = detail.get('payload', {})
+                parts = payload.get('parts', [])
+                if parts:
+                    for part in parts:
+                        if part.get('mimeType') in ('text/plain', 'text/html'):
+                            data = part.get('body', {}).get('data', '')
+                            body += base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+                else:
+                    data = payload.get('body', {}).get('data', '')
+                    if data:
+                        body = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+                
+                if keyword and keyword.lower() not in body.lower(): continue
+                code = self._safe_extract(body, code_pattern)
+                if code: return code
+            return None
+
+        return self._run_polling_wait(timeout=timeout, poll_interval=5, poll_once=poll_once)
+
+class CFMailbox(GmailMailbox):
+    """Cloudflare 子域邮箱 + Gmail API 收信服务 (纯 DNS 模式)"""
+    def __init__(self, config: dict, proxy: str = None):
+        super().__init__(config, proxy)
+        self.cf_api_token = (config or {}).get("cf_api_token")
+        self.cf_zone_id = (config or {}).get("cf_zone_id")
+        self.cf_root_domain = (config or {}).get("cf_root_domain")
+
+    def _cf_request(self, method, path, **kwargs):
+        url = f"https://api.cloudflare.com/client/v4{path}"
+        headers = {"Authorization": f"Bearer {self.cf_api_token}", "Content-Type": "application/json"}
+        resp = requests.request(method, url, headers=headers, timeout=15, **kwargs)
+        data = resp.json()
+        if not data.get("success"):
+            raise RuntimeError(f"Cloudflare error: {data}")
+        return data
+
+    def get_email(self) -> MailboxAccount:
+        # 简化版：生成随机二级子域并指向 CF Mail
+        label = ''.join(random.choices("abcdefghijklmnopqrstuvwxyz", k=8))
+        fqdn = f"{label}.{self.cf_root_domain}"
+        
+        # 创建 MX 记录
+        mx_items = [
+            {"type": "MX", "content": "route1.mx.cloudflare.net", "priority": 10},
+            {"type": "MX", "content": "route2.mx.cloudflare.net", "priority": 20},
+            {"type": "MX", "content": "route3.mx.cloudflare.net", "priority": 30},
+            {"type": "TXT", "content": "v=spf1 include:_spf.mx.cloudflare.net ~all"}
+        ]
+        for item in mx_items:
+            payload = {"type": item["type"], "name": fqdn, "content": item["content"], "ttl": 1}
+            if item.get("priority"): payload["priority"] = item["priority"]
+            try:
+                self._cf_request("POST", f"/zones/{self.cf_zone_id}/dns_records", json=payload)
+            except Exception: pass
+            
+        local_part = ''.join(random.choices("abcdefghijklmnopqrstuvwxyz", k=6))
+        email = f"{local_part}@{fqdn}"
+        return MailboxAccount(email=email, account_id=email)
+
 def create_mailbox(
     provider: str, extra: dict = None, proxy: str = None
 ) -> "BaseMailbox":
@@ -248,6 +373,10 @@ def create_mailbox(
             timeout=timeout_value,
             proxy=proxy,
         )
+    elif provider == "gmail":
+        return GmailMailbox(extra, proxy=proxy)
+    elif provider == "cf_mail":
+        return CFMailbox(extra, proxy=proxy)
     elif provider == "duckmail":
         return DuckMailMailbox(
             api_url=(extra.get("duckmail_api_url") or "https://www.duckmail.sbs"),
